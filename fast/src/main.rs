@@ -28,49 +28,6 @@ const P: usize = 1 << PBITS;
 
 type S = &'static [u8];
 
-// ---------------------------------------------------------------- allocator
-
-/// System allocator that asks for transparent huge pages on large blocks (fewer TLB misses
-/// in the big hash tables and buckets). Harmless where THP is off.
-struct HugeAlloc;
-
-const HUGE_MIN: usize = 4 << 20;
-
-#[inline]
-fn advise_huge(p: *mut u8, size: usize) {
-    if size >= HUGE_MIN && !p.is_null() {
-        let a = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
-        let end = (p as usize + size) & !((2 << 20) - 1);
-        if end > a {
-            unsafe { sys::madvise(a as *mut _, end - a, 14) }; // MADV_HUGEPAGE
-        }
-    }
-}
-
-unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
-    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        let p = unsafe { std::alloc::System.alloc(l) };
-        advise_huge(p, l.size());
-        p
-    }
-    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
-        let p = unsafe { std::alloc::System.alloc_zeroed(l) };
-        advise_huge(p, l.size());
-        p
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(p, l) }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
-        let q = unsafe { std::alloc::System.realloc(p, l, n) };
-        advise_huge(q, n);
-        q
-    }
-}
-
-#[global_allocator]
-static GLOBAL: HugeAlloc = HugeAlloc;
-
 // ---------------------------------------------------------------- files
 
 mod sys {
