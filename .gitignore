@@ -1,0 +1,5 @@
+fast/target/
+__pycache__/
+*.pyc
+/out/
+/dev/
