@@ -28,6 +28,49 @@ const P: usize = 1 << PBITS;
 
 type S = &'static [u8];
 
+// ---------------------------------------------------------------- allocator
+
+/// System allocator that asks for transparent huge pages on large blocks (fewer TLB misses
+/// in the big hash tables and buckets). Harmless where THP is off.
+struct HugeAlloc;
+
+const HUGE_MIN: usize = 4 << 20;
+
+#[inline]
+fn advise_huge(p: *mut u8, size: usize) {
+    if size >= HUGE_MIN && !p.is_null() {
+        let a = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
+        let end = (p as usize + size) & !((2 << 20) - 1);
+        if end > a {
+            unsafe { sys::madvise(a as *mut _, end - a, 14) }; // MADV_HUGEPAGE
+        }
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(l) };
+        advise_huge(p, l.size());
+        p
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(l) };
+        advise_huge(p, l.size());
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        let q = unsafe { std::alloc::System.realloc(p, l, n) };
+        advise_huge(q, n);
+        q
+    }
+}
+
+#[global_allocator]
+static GLOBAL: HugeAlloc = HugeAlloc;
+
 // ---------------------------------------------------------------- files
 
 mod sys {
@@ -504,6 +547,80 @@ fn parse_cal(b: &[u8]) -> Option<i64> {
     Some((((month_start(y, mo, leap) + d - 1) * 24 + h) * 60 + mi) * 60_000 + s * 1000 - off)
 }
 
+/// The last calendar date parsed (bytes 0..10 of an F1/F2 timestamp) and its day number.
+/// Rows in a chunk mostly share a few dates, so most timestamps only need their time parsed.
+#[derive(Default, Clone, Copy)]
+struct DateSlot {
+    k: u64,
+    k2: u16,
+    day: i64,
+}
+
+/// Direct-mapped by day of month, so a window of up to 28 days never evicts.
+#[derive(Default, Clone, Copy)]
+struct DateCache {
+    slots: [DateSlot; 32],
+}
+
+#[inline(always)]
+fn parse_ts_c(b: &[u8], c: &mut DateCache) -> i64 {
+    let l = b.len();
+    if (l == 20 || l == 25) && b[4] == b'-' {
+        return parse_cal_c(b, c).unwrap_or(BAD);
+    }
+    parse_ts(b)
+}
+
+#[inline(always)]
+fn parse_cal_c(b: &[u8], c: &mut DateCache) -> Option<i64> {
+    if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let k = load8(b, 0);
+    let k2 = u16::from_le_bytes([b[8], b[9]]);
+    let si = (b[8] as usize * 10 + b[9] as usize) & 31;
+    let slot = &mut c.slots[si];
+    let day = if k == slot.k && k2 == slot.k2 {
+        slot.day
+    } else {
+        // validate and compute the date: reuse the full parser on a midnight UTC copy
+        let mut t = [0u8; 20];
+        t[..10].copy_from_slice(&b[..10]);
+        t[10..].copy_from_slice(b"T00:00:00Z");
+        let ms = parse_cal(&t)?;
+        let day = ms / DAY;
+        *slot = DateSlot { k, k2, day };
+        day
+    };
+    let h = d2(b, 11)?;
+    let mi = d2(b, 14)?;
+    let s = d2(b, 17)?;
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let mut off = 0;
+    if b.len() == 20 {
+        if b[19] != b'Z' {
+            return None;
+        }
+    } else {
+        let sg = b[19];
+        if (sg != b'+' && sg != b'-') || b[22] != b':' {
+            return None;
+        }
+        let oh = d2(b, 20)?;
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        off = (oh * 60 + om) * 60_000;
+        if sg == b'-' {
+            off = -off;
+        }
+    }
+    Some(((day * 24 + h) * 60 + mi) * 60_000 + s * 1000 - off)
+}
+
 /// Digits only, 1..=10_000_000; 0 means invalid.
 #[inline]
 fn parse_price(b: &[u8]) -> u32 {
@@ -613,6 +730,8 @@ fn part_of(h: u64) -> usize {
 }
 
 fn parse_events(ctx: &Ctx, chunk: S, skip: bool, out: &mut [Vec<RawEv>]) {
+    let mut c_ing = DateCache::default();
+    let mut c_ts = DateCache::default();
     for_records::<7>(chunk, skip, |f| {
         let eid = f[0];
         if eid.is_empty() {
@@ -621,7 +740,7 @@ fn parse_events(ctx: &Ctx, chunk: S, skip: bool, out: &mut [Vec<RawEv>]) {
         let (h, h2) = hash2(eid);
         // ingest_ts is always valid F1 per the rules; an invalid one can never be the kept copy
         let ing = {
-            let x = parse_ts(f[3]);
+            let x = parse_ts_c(f[3], &mut c_ing);
             if x == BAD { i64::MAX } else { x }
         };
         let mut r = RawEv { h, h2, ing, ts: 0, u1: 0, u2: 0, uptr: std::ptr::null(), pk: 0 };
@@ -629,7 +748,7 @@ fn parse_events(ctx: &Ctx, chunk: S, skip: bool, out: &mut [Vec<RawEv>]) {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let t = parse_ts(f[2]);
+            let t = parse_ts_c(f[2], &mut c_ts);
             if t == BAD || t < ctx.ws || t >= ctx.we || ing == i64::MAX || ing - t > DAY {
                 break 'v;
             }
@@ -660,11 +779,12 @@ fn parse_events(ctx: &Ctx, chunk: S, skip: bool, out: &mut [Vec<RawEv>]) {
 
 fn parse_clicks(ctx: &Ctx, chunk: S, skip: bool, out: &mut Vec<RawCl>) {
     let lo = ctx.ws - WEEK;
+    let mut c_ts = DateCache::default();
     for_records::<4>(chunk, skip, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let t = parse_ts(f[3]);
+        let t = parse_ts_c(f[3], &mut c_ts);
         if t == BAD || t < lo || t >= ctx.we {
             return;
         }
@@ -736,6 +856,7 @@ fn par<T: Send, F: Fn(&mut T, usize) + Sync>(threads: usize, n: usize, init: imp
 
 /// Linked IDs: 128-bit identity -> person (128-bit identity of the person's name, and the name).
 #[derive(Clone, Copy)]
+#[repr(C, align(64))]
 struct LinkSlot {
     k1: u64,
     k2: u64,
@@ -1101,9 +1222,10 @@ fn main() {
     if args.iter().any(|a| a == "--ts-selftest") {
         // read lines from stdin, print parse_ts results (for testing against the reference)
         use std::io::BufRead;
+        let mut cache = DateCache::default();
         for line in std::io::stdin().lock().split(b'\n') {
             let line = line.unwrap();
-            let v = parse_ts(&line);
+            let v = parse_ts_c(&line, &mut cache);
             if v == BAD { println!("BAD"); } else if v == i64::MAX { println!("HUGE"); } else { println!("{v}"); }
         }
         return;
